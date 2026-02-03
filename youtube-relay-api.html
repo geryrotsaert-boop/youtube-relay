@@ -33,31 +33,72 @@
         let player = null;
         let isReady = false;
         
+        // Récupérer les paramètres URL
         const urlParams = new URLSearchParams(window.location.search);
         const initialVideoId = urlParams.get('v');
+        const playerId = urlParams.get('playerId') || 'relay-player';
+        const autoplay = urlParams.get('autoplay') !== '0';
+        const controls = urlParams.get('controls') !== '0';
         
-        function sendMessageToParent(type, data) {
-            if (window.parent !== window) {
-                window.parent.postMessage({
-                    source: 'youtube-relay',
-                    type: type,
-                    data: data
-                }, '*');
+        console.log('[RELAY] Initialized with playerId:', playerId, 'videoId:', initialVideoId);
+        
+        // Envoyer message au parent dans le format attendu par le proxy
+        function sendToParent(type, extraData) {
+            if (window.parent === window) return;
+            
+            const message = {
+                type: type,
+                playerId: playerId,
+                ...extraData
+            };
+            
+            console.log('[RELAY] Sending:', message);
+            window.parent.postMessage(message, '*');
+        }
+        
+        // Envoyer les infos vidéo
+        function sendVideoInfo() {
+            if (!player || !isReady) return;
+            try {
+                const videoData = player.getVideoData();
+                sendToParent('videoInfo', {
+                    title: videoData.title || '',
+                    author: videoData.author || '',
+                    video_id: videoData.video_id || ''
+                });
+            } catch(e) {
+                console.log('[RELAY] Could not get video data:', e);
             }
         }
         
+        // Timer pour envoyer currentTime régulièrement
+        setInterval(function() {
+            if (player && isReady) {
+                try {
+                    sendToParent('timeUpdate', {
+                        currentTime: player.getCurrentTime(),
+                        duration: player.getDuration()
+                    });
+                } catch(e) {}
+            }
+        }, 1000);
+        
         function onYouTubeIframeAPIReady() {
+            console.log('[RELAY] YouTube API Ready');
+            
             player = new YT.Player('player', {
                 height: '100%',
                 width: '100%',
                 videoId: initialVideoId || '',
                 host: 'https://www.youtube-nocookie.com',
                 playerVars: {
-                    'autoplay': 1,
-                    'controls': 1,
+                    'autoplay': autoplay ? 1 : 0,
+                    'controls': controls ? 1 : 0,
                     'rel': 0,
                     'fs': 1,
-                    'modestbranding': 1
+                    'modestbranding': 1,
+                    'enablejsapi': 1,
+                    'origin': window.location.origin
                 },
                 events: {
                     'onReady': onPlayerReady,
@@ -68,42 +109,55 @@
         }
         
         function onPlayerReady(event) {
+            console.log('[RELAY] Player Ready');
             isReady = true;
-            sendMessageToParent('onReady', {
-                videoId: initialVideoId
+            
+            sendToParent('ready', {
+                duration: player.getDuration()
             });
+            
+            // Envoyer les infos vidéo après un court délai
+            setTimeout(sendVideoInfo, 500);
         }
         
         function onPlayerStateChange(event) {
-            sendMessageToParent('onStateChange', {
-                state: event.data,
-                videoId: player.getVideoData().video_id,
-                currentTime: player.getCurrentTime(),
-                duration: player.getDuration()
+            console.log('[RELAY] State Change:', event.data);
+            
+            sendToParent('stateChange', {
+                state: event.data
             });
+            
+            // Envoyer les infos vidéo quand la lecture commence
+            if (event.data === YT.PlayerState.PLAYING) {
+                sendVideoInfo();
+            }
         }
         
         function onPlayerError(event) {
-            sendMessageToParent('onError', {
-                error: event.data,
-                videoId: player.getVideoData().video_id
+            console.log('[RELAY] Error:', event.data);
+            
+            sendToParent('error', {
+                error: event.data
             });
         }
         
+        // Écouter les commandes du parent
         window.addEventListener('message', function(event) {
-            if (!player || !isReady) return;
+            const data = event.data;
+            if (!data || data.type !== 'command') return;
+            if (data.playerId && data.playerId !== playerId) return;
             
-            const message = event.data;
-            if (!message || !message.command) return;
+            console.log('[RELAY] Received command:', data.command, data.args);
+            
+            if (!player || !isReady) {
+                console.log('[RELAY] Player not ready, ignoring command');
+                return;
+            }
             
             try {
-                switch(message.command) {
-                    case 'loadVideoById':
-                        if (message.videoId) {
-                            player.loadVideoById(message.videoId);
-                        }
-                        break;
-                    
+                const args = data.args || {};
+                
+                switch(data.command) {
                     case 'playVideo':
                         player.playVideo();
                         break;
@@ -116,15 +170,35 @@
                         player.stopVideo();
                         break;
                     
+                    case 'loadVideoById':
+                        if (args.videoId) {
+                            player.loadVideoById({
+                                videoId: args.videoId,
+                                startSeconds: args.startSeconds || 0
+                            });
+                            // Envoyer les infos après chargement
+                            setTimeout(sendVideoInfo, 1000);
+                        }
+                        break;
+                    
+                    case 'cueVideoById':
+                        if (args.videoId) {
+                            player.cueVideoById({
+                                videoId: args.videoId,
+                                startSeconds: args.startSeconds || 0
+                            });
+                        }
+                        break;
+                    
                     case 'seekTo':
-                        if (typeof message.seconds !== 'undefined') {
-                            player.seekTo(message.seconds, message.allowSeekAhead !== false);
+                        if (typeof args.seconds !== 'undefined') {
+                            player.seekTo(args.seconds, args.allowSeekAhead !== false);
                         }
                         break;
                     
                     case 'setVolume':
-                        if (typeof message.volume !== 'undefined') {
-                            player.setVolume(message.volume);
+                        if (typeof args.volume !== 'undefined') {
+                            player.setVolume(args.volume);
                         }
                         break;
                     
@@ -136,40 +210,27 @@
                         player.unMute();
                         break;
                     
-                    case 'getPlayerState':
-                        sendMessageToParent('playerState', {
-                            state: player.getPlayerState(),
-                            currentTime: player.getCurrentTime(),
-                            duration: player.getDuration(),
-                            volume: player.getVolume(),
-                            isMuted: player.isMuted()
-                        });
+                    case 'getVideoData':
+                        sendVideoInfo();
                         break;
                     
-                    case 'getCurrentTime':
-                        sendMessageToParent('currentTime', {
-                            currentTime: player.getCurrentTime()
-                        });
-                        break;
-                    
-                    case 'getDuration':
-                        sendMessageToParent('duration', {
-                            duration: player.getDuration()
-                        });
-                        break;
+                    default:
+                        console.log('[RELAY] Unknown command:', data.command);
                 }
             } catch(e) {
-                sendMessageToParent('error', {
-                    error: 'Command execution failed: ' + e.message
+                console.error('[RELAY] Command error:', e);
+                sendToParent('error', {
+                    error: 'Command failed: ' + e.message
                 });
             }
         });
         
+        // Gestion erreur globale
         window.addEventListener('error', function(e) {
             document.getElementById('player').style.display = 'none';
             document.getElementById('error').style.display = 'block';
-            sendMessageToParent('loadError', {
-                message: e.message
+            sendToParent('error', {
+                error: 'Load error: ' + e.message
             });
         });
     </script>
